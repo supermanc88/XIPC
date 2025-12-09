@@ -189,9 +189,10 @@ typedef struct ipc_socket {
     shm_header_t* header;    // 便捷指针：指向头部
     uint8_t* data_buffer;    // 便捷指针：指向 RingBuffer 数据区
 
-    // 通知通道 (FIFO) - 用于 epoll
-    int my_event_fd;         // 我监听的 FD (Read End)
-    int peer_event_fd;       // 对方监听的 FD (Write End)
+    // 通知通道 (EventFD / FIFO)
+    // Linux 下优先使用 eventfd (更轻量，仅需 8 字节计数器)，其他系统使用 Named Pipe
+    int my_event_fd;         // 我监听的 FD
+    int peer_event_fd;       // 对方监听的 FD
 } ipc_socket_t;
 
 // 标志位
@@ -260,18 +261,18 @@ void ipc_close(ipc_socket_t* sock, int unlink);
 1. **计算空间**: `space = capacity - (write - read)`.
 2. **非阻塞检查**:
    - 如果 `space == 0` 且是 `NONBLOCK`: 返回 -1, `errno = EAGAIN`.
-3. **阻塞等待**:
+3. **阻塞等待 (混合轮询 Hybrid Polling)**:
    - 如果 `space == 0` 且是 `BLOCKING`: 
-     - 循环调用 `read(signal_write_fd, ...)` 阻塞等待消费者腾出空间。
-     - *注意*: 这里利用 OS 的 Pipe 阻塞机制挂起线程，避免 CPU 空转。
-     - 被唤醒后，重新计算 `space`。
+     - **阶段 1 (Spin)**: 先进行短时间的自旋重试 (e.g. 循环 1000 次)，检查 `read_idx` 是否变化。
+     - **阶段 2 (Sleep)**: 自旋失败后，标记“发送者等待中”状态位，然后调用 `read(my_event_fd)` 进入内核阻塞。
+     - 被唤醒后，清除状态位，重新计算 `space`。
 4. **数据拷贝**:
    - `chunk = min(len, space)`.
    - `memcpy` 数据到 RingBuffer (处理 RingBuffer 回绕)。
    - `atomic_add(&write_idx, chunk)`.
 5. **触发通知**:
-   - 写入 `signal_read_fd` (1字节)，通知对端有数据可读。
-   - *优化*: 仅当 `old_write_idx == read_idx` (从空变有) 时才必须通知，或者为了简化逻辑总是通知(Level Trigger通过读取清理)。
+   - **智能通知**: 检查对端是否处于“等待中”状态，或者缓冲区是否“从空变有”。
+   - 仅在必要时写入 `peer_event_fd` (eventfd write 8 bytes)，避免频繁系统调用。
 6. **循环处理**:
    - 如果是 `BLOCKING` 且 `chunk < len` (未写完): `len -= chunk`, `data += chunk`, 重复步骤 1 继续写剩余部分。
    - 否则返回 `total_written`.
@@ -281,15 +282,17 @@ void ipc_close(ipc_socket_t* sock, int unlink);
 1. **计算数据**: `avail = write - read`.
 2. **非阻塞检查**:
    - 如果 `avail == 0` 且是 `NONBLOCK`: 返回 -1, `errno = EAGAIN`.
-3. **阻塞等待**:
+3. **阻塞等待 (混合轮询 Hybrid Polling)**:
    - 如果 `avail == 0` 且是 `BLOCKING`:
-     - 循环调用 `read(signal_read_fd, ...)` 阻塞等待生产者写入数据。
+     - **阶段 1 (Spin)**: 自旋循环检查 `write_idx`。
+     - **阶段 2 (Sleep)**: 标记“接收者等待中”，调用 `read(my_event_fd)` 阻塞。
 4. **数据拷贝**:
    - `chunk = min(len, avail)`.
    - `memcpy` 数据到用户 Buffer.
    - `atomic_add(&read_idx, chunk)`.
 5. **触发通知**:
-   - 写入 `signal_write_fd` (1字节)，通知对端有空间了。
+   - 同样采用智能通知策略，仅在必要时通知发送者（如缓冲区从满变不满）。
+   - 写入 `peer_event_fd`。
 6. 返回 `chunk`.
 
 ### 4.3 初始化流程 (ipc_socket_open)
