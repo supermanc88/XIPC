@@ -83,15 +83,16 @@ typedef struct {
 在调用 `ipc_socket_open` 之前，Client 和 Server 需通过 Unix Domain Socket 完成以下协商：
 
 1.  **Connect**: Client 连接 Server 的 UDS (e.g. `/tmp/xipc_control.sock`).
-2.  **Request**: Client 发送握手请求，包含：
-    - Client UID (鉴权)
-    - **Requested Size** (期望的共享内存大小)
-3.  **Decision**: Server 收到请求后，根据业务逻辑决定：
-    - 是否允许连接
-    - 分配的 Session ID
-    - 最终确定的 SHM 大小 (Actual Size)
-4.  **Response**: Server 返回 Session ID 和 Actual Size。
-5.  **Attach**: 双方使用 Session ID 作为 `name` 调用 `ipc_socket_open`。
+2.  **Request**: Client 发送握手请求 (UID, Requested Size).
+3.  **Decision**: Server 决定分配 Session ID 和 Size.
+4.  **Resource Creation**: 
+    - Server 创建共享内存文件。
+    - **Server 创建一对 `eventfd` (或者 Named Pipes)**。
+5.  **Response**: Server 发送响应数据，并**通过 `SCM_RIGHTS` 将 `eventfd` 句柄传递给 Client**。
+6.  **Attach**: 
+    - Client 收到响应，解析 Session ID。
+    - Client 从辅助数据中提取出 `eventfd`。
+    - 双方调用 `ipc_socket_open` (Client 直接使用提取出的 FD，不再创建)。
 
 ### 3.3 控制平面 API 设计 (Control Plane)
 
@@ -109,6 +110,7 @@ typedef struct {
 typedef struct {
     char session_name[64]; // 协商后的 SHM 名称
     size_t shm_size;       // 最终确认的大小
+    int event_fds[2];      // [0]=ReadFD, [1]=WriteFD (由握手传递而来)
 } ipc_session_info_t;
 
 // Server 端控制句柄
@@ -136,11 +138,10 @@ int ipc_control_server_accept_request(ipc_control_server_t* server, ipc_request_
  * 发送握手响应 (同意连接)
  * 服务端决定分配的 session_name 和 actual_size 后调用此函数。
  * 
- * 注意：为了防止数据丢失，函数内部应执行“优雅关闭 (Graceful Shutdown)”流程：
- * 1. 发送响应数据。
- * 2. shutdown(SHUT_WR) 关闭写端。
- * 3. (可选) 阻塞读取直到收到 EOF (客户端关闭连接)。
- * 4. close() 释放资源。
+ * 关键逻辑：
+ * 1. Server 创建一对 eventfd (fd1, fd2)。
+ * 2. 通过 SCM_RIGHTS 将 fd1(ClientRead) 和 fd2(ClientWrite) 发送给 Client。
+ * 3. Server 自己保留 fd2(ServerRead) 和 fd1(ServerWrite)。
  * 
  * @param server 控制句柄
  * @param req 对应的请求对象
@@ -160,9 +161,14 @@ void ipc_control_server_reject(ipc_control_server_t* server, ipc_request_t* req,
 /**
  * 客户端连接控制平面并执行握手
  * 
+ * 关键逻辑：
+ * 1. 连接并发送请求。
+ * 2. 接收响应数据。
+ * 3. 从辅助数据 (CMSG) 中提取服务端传递过来的 eventfd 句柄，填入 out_info->event_fds。
+ * 
  * @param address 服务端地址
  * @param requested_size 期望申请的共享内存大小
- * @param out_info 输出参数，接收服务端最终分配的会话信息
+ * @param out_info 输出参数，接收服务端最终分配的会话信息 (含 eventfd)
  * @return 0 成功, -1 失败
  */
 int ipc_control_client_connect(const char* address, size_t requested_size, ipc_session_info_t* out_info);
@@ -201,12 +207,15 @@ typedef struct ipc_socket {
 
 /**
  * 打开/创建 IPC 通道
- * @param name 唯一的会话名称 (由握手阶段协商得出)
+ * 
+ * @param name 会话名称
  * @param size 共享内存大小 (仅 IPC_CREAT 时有效)
  * @param flags IPC_NONBLOCK | IPC_CREAT
- * @return 句柄指针，失败返回 NULL
+ * @param fds (可选) 如果是 Client 模式，传入握手阶段获取的 event_fds[2]；
+ *            如果是 Server 模式，传入 NULL (内部会自动创建或复用)。
+ * @return 句柄指针
  */
-ipc_socket_t* ipc_socket_open(const char* name, int size, int flags);
+ipc_socket_t* ipc_socket_open(const char* name, int size, int flags, int* fds);
 
 /**
  * 设置/清除阻塞模式
@@ -296,11 +305,17 @@ void ipc_close(ipc_socket_t* sock, int unlink);
 6. 返回 `chunk`.
 
 ### 4.3 初始化流程 (ipc_socket_open)
-1. `shm_open()`: 打开 SHM 对象。
-2. `ftruncate()`: 设置大小 (仅 Server)。
-3. `mmap()`: 映射 SHM。
-4. `mkfifo()`: 创建两个 Named Pipe (e.g. `name_s2c`, `name_c2s`).
-5. `open()`: 以 `O_RDWR` (避免 pipe 无 reader 时 open 阻塞) 打开 Pipe.
+
+**Server 端 (IPC_CREAT)**:
+1. `shm_open()` + `ftruncate()` + `mmap()`: 创建并映射共享内存。
+2. `eventfd()`: 创建两个 eventfd (my_fd, peer_fd)。
+3. 将这两个 FD 保存，准备在 `ipc_control_server_respond` 中通过 SCM_RIGHTS 发送给 Client。
+
+**Client 端 (Attach)**:
+1. `shm_open()` + `mmap()`: 打开并映射共享内存。
+2. **FD 绑定**: 直接使用 `ipc_socket_open` 参数中传入的 `fds` (来自握手阶段的 SCM_RIGHTS 接收)。
+   - `sock->my_event_fd = fds[0]`
+   - `sock->peer_event_fd = fds[1]`
 
 ## 5. 使用示例 (多客户端模式)
 
